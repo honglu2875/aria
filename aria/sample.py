@@ -183,9 +183,7 @@ class TorchCompileRunner:
         attn_mask: torch.Tensor,
         past_kv: list[KVCache],
     ):
-        del past_kv
         return self.compiled_fn(src, attn_mask, past_kv)
-
 
 
 def _wrap_callable(
@@ -200,8 +198,10 @@ def _wrap_callable(
     varying lengths."""
     # The dict maps sequence position to the corresponding cudagraph callable
     if compilation_method not in ["compile", "cudagraph"]:
-        raise ValueError(f"`compilation_method` needs to be one of ['compile', 'cudagraph']")
-    
+        raise ValueError(
+            f"`compilation_method` needs to be one of ['compile', 'cudagraph']"
+        )
+
     graph_map = {}
 
     total_len = token_shape[1]
