@@ -110,15 +110,9 @@ class CUDAGraphRunner:
         self, 
         src: torch.Tensor,
         attn_mask: torch.Tensor,
-        past_kv: KVCache,
+        past_kv: list[KVCache],
     ):
         assert self.graph is None
-        if isinstance(past_kv.next_pos, int):
-            self.next_pos = past_kv.next_pos
-        elif isinstance(past_kv.next_pos, torch.tensor):
-            self.next_pos = past_kv.next_pos.clone()
-        else:
-            raise ValueError(f"Wrong type of kv cache. Got {type(past_kv.next_pos)}")
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             logits = self.fn(
@@ -153,13 +147,9 @@ class CUDAGraphRunner:
     @property
     def batch_size(self):
         return self.input_buffers["src"].shape[0]
-    
-    @property
-    def next_pos(self):
-        return self.next_pos
 
 
-def _wrap_callable(fn: callable, initial_cache: KVCache, prompt_len: int, token_shape: tuple) -> callable:
+def _wrap_callable(fn: callable, initial_cache: list[KVCache], prompt_len: int, token_shape: tuple) -> callable:
     """A custom wrapper for cudagraph callables that takes a kv cache with
     varying lengths."""
     # The dict maps sequence position to the corresponding cudagraph callable
@@ -169,11 +159,11 @@ def _wrap_callable(fn: callable, initial_cache: KVCache, prompt_len: int, token_
 
     for cur_pos in range(prompt_len, total_len):
         if cur_pos == prompt_len:
-            token = torch.zeros(token_shape[:1] + (cur_pos,))
+            token = torch.zeros(token_shape[:1] + (cur_pos,), dtype=torch.int, device="cuda")
         else:
-            token = torch.zeros(token_shape[:1] + (1,))
-        attn_mask = torch.ones(token_shape[:1] + (cur_pos,), dtype=torch.bool)
-        next_pos = initial_cache.next_pos
+            token = torch.zeros(token_shape[:1] + (1,), dtype=torch.int, device="cuda")
+        attn_mask = torch.ones(token_shape[:1] + (cur_pos,), dtype=torch.bool, device="cuda")
+        next_pos = initial_cache[0].next_pos
         # Use next_pos to index cuda graph since they are the only indicator of 
         # the current position from the input data.
         graph_map[next_pos] = CUDAGraphRunner(fn)
@@ -183,9 +173,10 @@ def _wrap_callable(fn: callable, initial_cache: KVCache, prompt_len: int, token_
         with torch.cuda.stream(s):
             fn(token, attn_mask, initial_cache)
         torch.cuda.current_stream().wait_stream(s)
-        initial_cache.next_pos = next_pos
+        for cache in initial_cache:
+            cache.next_pos = next_pos
 
-        graph_map[cur_pos].capture(token, attn_mask, initial_cache)
+        graph_map[next_pos].capture(token, attn_mask, initial_cache)
 
     # Reset the KV cache for the real run
     for cache in initial_cache:
@@ -193,7 +184,7 @@ def _wrap_callable(fn: callable, initial_cache: KVCache, prompt_len: int, token_
 
     @functools.wraps(fn)
     def _fn(src, attn_mask, past_kv):
-        next_pos = past_kv.next_pos
+        next_pos = past_kv[0].next_pos
         return graph_map[next_pos](src, attn_mask, past_kv)
 
 
@@ -310,7 +301,7 @@ def greedy_sample(
     model.forward = _wrap_callable(model.forward, 
                                    initial_cache=past_kv, 
                                    prompt_len=prompt_len, 
-                                   max_new_tokens=max_new_tokens, 
+                                   token_shape=tokens.shape, 
     )
 
     for cur_pos in (
