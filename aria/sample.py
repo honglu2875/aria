@@ -102,7 +102,6 @@ class CUDAGraphRunner:
     def __init__(self, fn: callable):
         self.fn = fn
         self.graph = None
-        self.next_pos = None
         self.input_buffers = {}
         self.output_buffers = {}
 
@@ -113,6 +112,18 @@ class CUDAGraphRunner:
         past_kv: list[KVCache],
     ):
         assert self.graph is None
+
+        # Warm up CUDA stream
+        next_pos = past_kv[0].next_pos
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            self.fn(src, attn_mask, past_kv)
+        torch.cuda.current_stream().wait_stream(s)
+        for cache in past_kv:
+            cache.next_pos = next_pos
+
+        # Perform CUDA graph capturing
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             logits = self.fn(
@@ -152,20 +163,53 @@ class CUDAGraphRunner:
         return self.input_buffers["src"].shape[0]
 
 
+class TorchCompileRunner:
+    def __init__(self, fn: callable):
+        self.fn = fn
+        self.compiled_fn = None
+
+    def capture(
+        self,
+        src: torch.Tensor,
+        attn_mask: torch.Tensor,
+        past_kv: list[KVCache],
+    ):
+        assert self.compiled_fn is None
+        self.compiled_fn = torch.compile(self.fn)
+
+    def __call__(
+        self,
+        src: torch.Tensor,
+        attn_mask: torch.Tensor,
+        past_kv: list[KVCache],
+    ):
+        del past_kv
+        return self.compiled_fn(src, attn_mask, past_kv)
+
+
+
 def _wrap_callable(
     fn: callable,
     attn_mask_buffer: torch.Tensor,
     initial_cache: list[KVCache],
     prompt_len: int,
     token_shape: tuple,
+    compilation_method: str = "compile",
 ) -> callable:
     """A custom wrapper for cudagraph callables that takes a kv cache with
     varying lengths."""
     # The dict maps sequence position to the corresponding cudagraph callable
+    if compilation_method not in ["compile", "cudagraph"]:
+        raise ValueError(f"`compilation_method` needs to be one of ['compile', 'cudagraph']")
+    
     graph_map = {}
 
     total_len = token_shape[1]
-    logger.info("Capturing CUDA Graph:")
+    if compilation_method == "cudagraph":
+        logger.info("Capturing CUDA Graph:")
+    elif compilation_method == "compile":
+        logger.info("Compiling model:")
+
     for cur_pos in (
         pbar := tqdm(
             range(prompt_len, total_len),
@@ -182,16 +226,11 @@ def _wrap_callable(
                 token_shape[:1] + (1,), dtype=torch.int, device="cuda"
             )
         attn_mask = attn_mask_buffer[:, :cur_pos]
-        next_pos = initial_cache[0].next_pos
-        graph_map[cur_pos] = CUDAGraphRunner(fn)
 
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            fn(token, attn_mask, initial_cache)
-        torch.cuda.current_stream().wait_stream(s)
-        for cache in initial_cache:
-            cache.next_pos = next_pos
+        if compilation_method == "cudagraph":
+            graph_map[cur_pos] = CUDAGraphRunner(fn)
+        elif compilation_method == "compile":
+            graph_map[cur_pos] = TorchCompileRunner(fn)
 
         graph_map[cur_pos].capture(token, attn_mask, initial_cache)
 
