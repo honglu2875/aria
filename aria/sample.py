@@ -140,7 +140,8 @@ class CUDAGraphRunner:
         del past_kv
 
         self.input_buffers["src"].copy_(src)
-        self.input_buffers["attn_mask"].copy_(attn_mask)
+        if attn_mask.data_ptr() != self.input_buffers["attn_mask"].data_ptr():
+            self.input_buffers["attn_mask"].copy_(attn_mask)
 
         self.graph.replay()
 
@@ -153,6 +154,7 @@ class CUDAGraphRunner:
 
 def _wrap_callable(
     fn: callable,
+    attn_mask_buffer: torch.Tensor,
     initial_cache: list[KVCache],
     prompt_len: int,
     token_shape: tuple,
@@ -179,13 +181,9 @@ def _wrap_callable(
             token = torch.zeros(
                 token_shape[:1] + (1,), dtype=torch.int, device="cuda"
             )
-        attn_mask = torch.ones(
-            token_shape[:1] + (cur_pos,), dtype=torch.bool, device="cuda"
-        )
+        attn_mask = attn_mask_buffer[:, :cur_pos]
         next_pos = initial_cache[0].next_pos
-        # Use next_pos to index cuda graph since they are the only indicator of
-        # the current position from the input data.
-        graph_map[next_pos] = CUDAGraphRunner(fn)
+        graph_map[cur_pos] = CUDAGraphRunner(fn)
 
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
@@ -195,7 +193,7 @@ def _wrap_callable(
         for cache in initial_cache:
             cache.next_pos = next_pos
 
-        graph_map[next_pos].capture(token, attn_mask, initial_cache)
+        graph_map[cur_pos].capture(token, attn_mask, initial_cache)
 
     # Reset the KV cache for the real run
     for cache in initial_cache:
@@ -203,8 +201,8 @@ def _wrap_callable(
 
     @functools.wraps(fn)
     def _fn(src, attn_mask, past_kv):
-        next_pos = past_kv[0].next_pos
-        return graph_map[next_pos](src, attn_mask, past_kv)
+        cur_pos = attn_mask.shape[1]
+        return graph_map[cur_pos](src, attn_mask, past_kv)
 
     return _fn
 
@@ -321,6 +319,7 @@ def greedy_sample(
 
     model.forward = _wrap_callable(
         model.forward,
+        attn_mask_buffer=attn_mask,
         initial_cache=past_kv,
         prompt_len=prompt_len,
         token_shape=tokens.shape,
