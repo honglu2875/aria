@@ -6,7 +6,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the GNU
 # General Public License version 3.
-
+import functools
+import logging
 import math
 import torch
 
@@ -15,7 +16,12 @@ from tqdm import tqdm
 
 from aria.model import TransformerLM
 from aria.tokenizer import Tokenizer
+from aria.model.cache import KVCache
 
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.addHandler(logging.StreamHandler())
 
 # TODO: Add which instruments were detected in the prompt
 
@@ -90,6 +96,107 @@ def _batch_encode(tokenizer, prompts: list[list]) -> torch.Tensor:
     return torch.stack([tokenizer.encode(p) for p in prompts], dim=0)
 
 
+class CUDAGraphRunner:
+    """Capture and run a CUDA graph, à la vllm."""
+    
+    def __init__(self, fn: callable):
+        self.fn = fn
+        self.graph = None
+        self.next_pos = None
+        self.input_buffers = {}
+        self.output_buffers = {}
+
+    def capture(
+        self, 
+        src: torch.Tensor,
+        attn_mask: torch.Tensor,
+        past_kv: KVCache,
+    ):
+        assert self.graph is None
+        if isinstance(past_kv.next_pos, int):
+            self.next_pos = past_kv.next_pos
+        elif isinstance(past_kv.next_pos, torch.tensor):
+            self.next_pos = past_kv.next_pos.clone()
+        else:
+            raise ValueError(f"Wrong type of kv cache. Got {type(past_kv.next_pos)}")
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            logits = self.fn(
+                src, attn_mask=attn_mask, past_kv=past_kv,
+            )
+        torch.cuda.synchronize()
+
+        self.input_buffers = {
+            "src": src,
+            "attn_mask": attn_mask,
+        }
+        self.output_buffers = {
+            "logits": logits,
+        }
+        return
+    
+    def __call__(
+        self,
+        src: torch.Tensor,
+        attn_mask: torch.Tensor,
+        past_kv: list[KVCache],
+    ):
+        del past_kv
+
+        self.input_buffers["src"].copy_(src)
+        self.input_buffers["attn_mask"].copy(attn_mask)
+
+        self.graph.replay()
+
+        return self.output_buffers["logits"]
+    
+    @property
+    def batch_size(self):
+        return self.input_buffers["src"].shape[0]
+    
+    @property
+    def next_pos(self):
+        return self.next_pos
+
+
+def _wrap_callable(fn: callable, initial_cache: KVCache, prompt_len: int, token_shape: tuple) -> callable:
+    """A custom wrapper for cudagraph callables that takes a kv cache with
+    varying lengths."""
+    # The dict maps sequence position to the corresponding cudagraph callable
+    graph_map = {}
+
+    total_len = token_shape[1]
+
+    for cur_pos in range(prompt_len, total_len):
+        if cur_pos == prompt_len:
+            token = torch.zeros(token_shape[:1] + (cur_pos,))
+        else:
+            token = torch.zeros(token_shape[:1] + (1,))
+        attn_mask = torch.ones(token_shape[:1] + (cur_pos,), dtype=torch.bool)
+        next_pos = initial_cache.next_pos
+        # Use next_pos to index cuda graph since they are the only indicator of 
+        # the current position from the input data.
+        graph_map[next_pos] = CUDAGraphRunner(fn)
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            fn(token, attn_mask, initial_cache)
+        torch.cuda.current_stream().wait_stream(s)
+        initial_cache.next_pos = next_pos
+
+        graph_map[cur_pos].capture(token, attn_mask, initial_cache)
+
+    # Reset the KV cache for the real run
+    for cache in initial_cache:
+        cache.next_pos = 0
+
+    @functools.wraps(fn)
+    def _fn(src, attn_mask, past_kv):
+        next_pos = past_kv.next_pos
+        return graph_map[next_pos](src, attn_mask, past_kv)
+
+
 # Some good settings:
 # temp=0.85, top_p=0.9, cfg_gamma=1.4
 
@@ -103,6 +210,7 @@ def greedy_sample(
     device: torch.device | None = None,
     cfg_gamma: float | None = 1.4,
     cfg_mode: str | None = None,
+    cfg_window: int | None = None,
     neg_prompts: List[list] | None = None,
     neg_prompt_len: int | None = None,
     alpha: float | None = 0.4,
@@ -125,6 +233,7 @@ def greedy_sample(
             "linear": linearly increasing/decreasing CFG strength from 1.
             "hat": piecewise-linearly scale CFG gamma: 1 -> gamma -> 1
             "sine": sine curve from 1 -> gamma -> 1
+        cfg_window (int, optional): If not None, we use a sliding window of given length for negative prompt.
         neg_prompts (List[list], optional): Alternative prompts to sample from.
             Defaults to None ("unconditioned" model is approximated using only the last tokens of prompts).
         neg_prompt_len (int, optional): Max length used for the negative prompts.
@@ -170,7 +279,7 @@ def greedy_sample(
     if force_end:
         assert max_new_tokens > 130, "prompt too long to use force_end=True"
 
-    print(
+    logger.info(
         f"Using hyperparams: temp={temperature}, top_p={top_p}, gamma={cfg_gamma}, gen_len={max_new_tokens}"
     )
 
@@ -198,6 +307,12 @@ def greedy_sample(
         max_batch_size=tokens.size(0), max_len=total_len, device=device
     )
 
+    model.forward = _wrap_callable(model.forward, 
+                                   initial_cache=past_kv, 
+                                   prompt_len=prompt_len, 
+                                   max_new_tokens=max_new_tokens, 
+    )
+
     for cur_pos in (
         pbar := tqdm(
             range(start_pos, total_len),
@@ -222,6 +337,9 @@ def greedy_sample(
             cond_logits = logits[: logits.size(0) // 2]
             uncond_logits = logits[logits.size(0) // 2 :]
             logits = uncond_logits + coeff * (cond_logits - uncond_logits)
+            # Update the sliding window
+            if cfg_window is not None and cur_pos - start_pos >= cfg_window:
+                attn_mask[:, cur_pos - cfg_window].zero_()
 
         if temperature > 0:
             probs = torch.softmax(logits / temperature, dim=-1)
