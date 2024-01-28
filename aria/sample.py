@@ -98,7 +98,7 @@ def _batch_encode(tokenizer, prompts: list[list]) -> torch.Tensor:
 
 class CUDAGraphRunner:
     """Capture and run a CUDA graph, à la vllm."""
-    
+
     def __init__(self, fn: callable):
         self.fn = fn
         self.graph = None
@@ -107,7 +107,7 @@ class CUDAGraphRunner:
         self.output_buffers = {}
 
     def capture(
-        self, 
+        self,
         src: torch.Tensor,
         attn_mask: torch.Tensor,
         past_kv: list[KVCache],
@@ -116,7 +116,9 @@ class CUDAGraphRunner:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             logits = self.fn(
-                src, attn_mask=attn_mask, past_kv=past_kv,
+                src,
+                attn_mask=attn_mask,
+                past_kv=past_kv,
             )
         torch.cuda.synchronize()
 
@@ -128,7 +130,7 @@ class CUDAGraphRunner:
             "logits": logits,
         }
         return
-    
+
     def __call__(
         self,
         src: torch.Tensor,
@@ -143,13 +145,18 @@ class CUDAGraphRunner:
         self.graph.replay()
 
         return self.output_buffers["logits"]
-    
+
     @property
     def batch_size(self):
         return self.input_buffers["src"].shape[0]
 
 
-def _wrap_callable(fn: callable, initial_cache: list[KVCache], prompt_len: int, token_shape: tuple) -> callable:
+def _wrap_callable(
+    fn: callable,
+    initial_cache: list[KVCache],
+    prompt_len: int,
+    token_shape: tuple,
+) -> callable:
     """A custom wrapper for cudagraph callables that takes a kv cache with
     varying lengths."""
     # The dict maps sequence position to the corresponding cudagraph callable
@@ -159,12 +166,18 @@ def _wrap_callable(fn: callable, initial_cache: list[KVCache], prompt_len: int, 
 
     for cur_pos in range(prompt_len, total_len):
         if cur_pos == prompt_len:
-            token = torch.zeros(token_shape[:1] + (cur_pos,), dtype=torch.int, device="cuda")
+            token = torch.zeros(
+                token_shape[:1] + (cur_pos,), dtype=torch.int, device="cuda"
+            )
         else:
-            token = torch.zeros(token_shape[:1] + (1,), dtype=torch.int, device="cuda")
-        attn_mask = torch.ones(token_shape[:1] + (cur_pos,), dtype=torch.bool, device="cuda")
+            token = torch.zeros(
+                token_shape[:1] + (1,), dtype=torch.int, device="cuda"
+            )
+        attn_mask = torch.ones(
+            token_shape[:1] + (cur_pos,), dtype=torch.bool, device="cuda"
+        )
         next_pos = initial_cache[0].next_pos
-        # Use next_pos to index cuda graph since they are the only indicator of 
+        # Use next_pos to index cuda graph since they are the only indicator of
         # the current position from the input data.
         graph_map[next_pos] = CUDAGraphRunner(fn)
 
@@ -298,10 +311,11 @@ def greedy_sample(
         max_batch_size=tokens.size(0), max_len=total_len, device=device
     )
 
-    model.forward = _wrap_callable(model.forward, 
-                                   initial_cache=past_kv, 
-                                   prompt_len=prompt_len, 
-                                   token_shape=tokens.shape, 
+    model.forward = _wrap_callable(
+        model.forward,
+        initial_cache=past_kv,
+        prompt_len=prompt_len,
+        token_shape=tokens.shape,
     )
 
     for cur_pos in (
