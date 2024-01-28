@@ -163,8 +163,14 @@ def _wrap_callable(
     graph_map = {}
 
     total_len = token_shape[1]
-
-    for cur_pos in range(prompt_len, total_len):
+    logger.info("Capturing CUDA Graph:")
+    for cur_pos in (
+        pbar := tqdm(
+            range(prompt_len, total_len),
+            total=total_len - prompt_len,
+            leave=False,
+        )
+    ):
         if cur_pos == prompt_len:
             token = torch.zeros(
                 token_shape[:1] + (cur_pos,), dtype=torch.int, device="cuda"
