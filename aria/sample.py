@@ -205,6 +205,8 @@ def _wrap_callable(
     def _fn(src, attn_mask, past_kv):
         next_pos = past_kv[0].next_pos
         return graph_map[next_pos](src, attn_mask, past_kv)
+    
+    return _fn
 
 
 # Some good settings:
