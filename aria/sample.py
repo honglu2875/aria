@@ -140,7 +140,7 @@ class CUDAGraphRunner:
         del past_kv
 
         self.input_buffers["src"].copy_(src)
-        self.input_buffers["attn_mask"].copy(attn_mask)
+        self.input_buffers["attn_mask"].copy_(attn_mask)
 
         self.graph.replay()
 
@@ -205,7 +205,7 @@ def _wrap_callable(
     def _fn(src, attn_mask, past_kv):
         next_pos = past_kv[0].next_pos
         return graph_map[next_pos](src, attn_mask, past_kv)
-    
+
     return _fn
 
 
